@@ -88,7 +88,7 @@ void NodeTable::processEvents()
         m_nodeEventHandler->processEvents();
 }
 
-void NodeTable::addNode(Node const& _node, NodeRelation _relation)
+NodeEntry* NodeTable::addNode(Node const& _node, NodeRelation _relation)
 {
     if (_relation == Known)
     {
@@ -98,36 +98,38 @@ void NodeTable::addNode(Node const& _node, NodeRelation _relation)
         nodeEntry->lastPongReceivedTime = RLPXDatagramFace::secondsSinceEpoch();
         DEV_GUARDED(x_nodes) { m_allNodes[_node.id] = nodeEntry; }
         noteActiveNode(_node.id, _node.endpoint);
-        return;
+        return nodeEntry.get();
     }
 
     if (!_node.endpoint || !_node.id)
     {
         LOG(m_logger) << "Supplied node has an invalid endpoint (" << _node.endpoint << ") or id ("
                       << _node.id << "). Skipping adding to node table.";
-        return;
+        return nullptr;
     }
 
     DEV_GUARDED(x_nodes)
     {
-        if (m_allNodes.count(_node.id))
+        auto const it = m_allNodes.find(_node.id);
+        if (it != m_allNodes.end())
         {
             LOG(m_logger) << "Node " << _node.id << "@" << _node.endpoint
                           << " is already in the node table";
-            return;
+            return it->second.get();
         }
     }
 
     if (m_hostNodeID == _node.id)
     {
         LOG(m_logger) << "Skip adding self to node table (" << _node.id << ")";
-        return;
+        return nullptr;
     }
 
     auto nodeEntry = make_shared<NodeEntry>(m_hostNodeID, _node.id, _node.endpoint);
     DEV_GUARDED(x_nodes) { m_allNodes[_node.id] = nodeEntry; }
     LOG(m_logger) << "Pending node " << _node.id << "@" << _node.endpoint;
     ping(*nodeEntry);
+    return nodeEntry.get();
 }
 
 list<NodeID> NodeTable::nodes() const
@@ -528,16 +530,17 @@ void NodeTable::onPacketReceived(
                 auto& in = dynamic_cast<PingNode&>(*packet);
                 in.source.setAddress(_from.address());
                 in.source.setUdpPort(_from.port());
-                addNode(Node(in.sourceid, in.source));
-                
+                auto entry = addNode(Node(in.sourceid, in.source));
+                if (entry)
+                    entry->lastPongSentTime = RLPXDatagramFace::secondsSinceEpoch();
+
+                // Send PONG response.
                 Pong p(in.source);
                 LOG(m_logger) << p.typeName() << " to " << in.sourceid << "@" << _from;
                 p.ts = nextRequestExpirationTime();
                 p.echo = in.echo;
                 p.sign(m_secret);
                 m_socket->send(p);
-                
-                m_allNodes[in.sourceid]->lastPongSentTime = RLPXDatagramFace::secondsSinceEpoch();
                 break;
             }
         }
